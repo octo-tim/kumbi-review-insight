@@ -1,26 +1,20 @@
 """
-로그인·사용자 관리.
+로그인·사용자 관리 (Postgres 버전).
 
-- bcrypt로 비밀번호 해싱 (RFP 10: "복호화 불가능한 해시")
+- bcrypt로 비밀번호 해싱
 - Streamlit session_state로 로그인 상태 유지
-- 역할(role)은 단순화: admin | manager | viewer
-  향후 RFP 5장의 9개 역할 체계로 확장 가능
-
-초기 관리자 계정:
-- 최초 기동 시 ADMIN_EMAIL / ADMIN_PASSWORD 환경변수로 1개 생성
-- 이후는 관리자 메뉴에서 추가
+- 역할: admin | manager | viewer
 """
 from __future__ import annotations
 
 import os
-import sqlite3
-from datetime import datetime
 
 import bcrypt
 import pandas as pd
+import psycopg
 import streamlit as st
 
-from db import get_conn
+from db import get_conn, get_engine
 
 ROLES = ["admin", "manager", "viewer"]
 
@@ -38,79 +32,95 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def ensure_bootstrap_admin():
     """
-    ADMIN_EMAIL / ADMIN_PASSWORD 환경변수가 있고 사용자가 0명이면
-    해당 계정을 admin 역할로 1회 생성.
+    사용자가 0명이면 ADMIN_EMAIL/ADMIN_PASSWORD (또는 기본값)로 admin 1명 생성.
     """
-    conn = get_conn()
-    cnt = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-    if cnt > 0:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM users")
+            row = cur.fetchone()
+    if row["n"] > 0:
         return
 
-    email = os.getenv("ADMIN_EMAIL", "").strip().lower()
-    password = os.getenv("ADMIN_PASSWORD", "")
-    if not email or not password:
-        # 환경변수 없으면 기본 관리자 생성 (최초 1회, 개발용)
-        email = "admin@example.com"
-        password = "changeme!"
+    email = os.getenv("ADMIN_EMAIL", "").strip().lower() or "admin@example.com"
+    password = os.getenv("ADMIN_PASSWORD", "") or "changeme!"
+
     try:
-        conn.execute(
-            "INSERT INTO users (email, name, password_hash, role) VALUES (?, ?, ?, 'admin')",
-            (email, "Admin", hash_password(password)),
-        )
-    except sqlite3.IntegrityError:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (email, name, password_hash, role) "
+                    "VALUES (%s, %s, %s, 'admin')",
+                    (email, "Admin", hash_password(password)),
+                )
+    except psycopg.errors.UniqueViolation:
         pass
 
 
 def login(email: str, password: str) -> dict | None:
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT id, email, name, role, password_hash, status FROM users WHERE email=?",
-        (email.strip().lower(),),
-    ).fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, email, name, role, password_hash, status "
+                "FROM users WHERE email=%s",
+                (email.strip().lower(),),
+            )
+            row = cur.fetchone()
     if not row or row["status"] != "active":
         return None
     if not verify_password(password, row["password_hash"]):
         return None
-    conn.execute(
-        "UPDATE users SET last_login_at=? WHERE id=?",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row["id"]),
-    )
-    return {"id": row["id"], "email": row["email"], "name": row["name"], "role": row["role"]}
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET last_login_at=now() WHERE id=%s", (row["id"],))
+
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "name": row["name"],
+        "role": row["role"],
+    }
 
 
 def list_users() -> pd.DataFrame:
-    conn = get_conn()
     return pd.read_sql_query(
-        "SELECT id, email, name, role, status, created_at, last_login_at FROM users ORDER BY created_at DESC",
-        conn,
+        "SELECT id, email, name, role, status, created_at, last_login_at "
+        "FROM users ORDER BY created_at DESC",
+        get_engine(),
     )
 
 
 def create_user(email: str, name: str, password: str, role: str) -> bool:
     if role not in ROLES:
         return False
-    conn = get_conn()
     try:
-        conn.execute(
-            "INSERT INTO users (email, name, password_hash, role) VALUES (?, ?, ?, ?)",
-            (email.strip().lower(), name.strip(), hash_password(password), role),
-        )
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (email, name, password_hash, role) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (email.strip().lower(), name.strip(), hash_password(password), role),
+                )
         return True
-    except sqlite3.IntegrityError:
+    except psycopg.errors.UniqueViolation:
+        return False
+    except psycopg.Error:
         return False
 
 
 def set_user_status(user_id: int, status: str):
-    conn = get_conn()
-    conn.execute("UPDATE users SET status=? WHERE id=?", (status, user_id))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET status=%s WHERE id=%s", (status, user_id))
 
 
 def reset_password(user_id: int, new_password: str):
-    conn = get_conn()
-    conn.execute(
-        "UPDATE users SET password_hash=? WHERE id=?",
-        (hash_password(new_password), user_id),
-    )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET password_hash=%s WHERE id=%s",
+                (hash_password(new_password), user_id),
+            )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -122,10 +132,6 @@ def current_user() -> dict | None:
 
 
 def require_login() -> dict:
-    """
-    로그인 폼을 렌더링하고 로그인된 사용자를 반환.
-    로그인 안 됐으면 st.stop()으로 렌더링 중단.
-    """
     user = current_user()
     if user:
         return user
@@ -146,7 +152,9 @@ def require_login() -> dict:
         else:
             st.error("이메일 또는 비밀번호가 올바르지 않습니다.")
 
-    st.caption("초기 관리자 계정은 배포 시 ADMIN_EMAIL / ADMIN_PASSWORD 환경변수로 지정합니다.")
+    st.caption(
+        "초기 관리자 계정은 배포 시 ADMIN_EMAIL / ADMIN_PASSWORD 환경변수로 지정합니다."
+    )
     st.stop()
 
 

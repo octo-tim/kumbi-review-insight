@@ -29,8 +29,17 @@ APP_TITLE = "꿈비그룹 통합 리뷰 인사이트 MVP"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 # DB 초기화 + 부트스트랩 관리자 생성
-db.init_db()
-auth.ensure_bootstrap_admin()
+try:
+    db.init_db()
+    auth.ensure_bootstrap_admin()
+except Exception as e:
+    st.error(
+        "데이터베이스 연결에 실패했습니다. "
+        "Railway의 Postgres 플러그인이 생성되어 있고 "
+        "DATABASE_URL 환경변수가 연결되어 있는지 확인해 주십시오."
+    )
+    st.code(str(e))
+    st.stop()
 
 
 # ──────────────────────────────────────────────────────────────

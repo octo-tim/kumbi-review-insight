@@ -2,7 +2,7 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false"
+# startCommand는 Procfile에 정의되어 있으므로 여기서 덮어쓰지 않음
 healthcheckPath = "/_stcore/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
